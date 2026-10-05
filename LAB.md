@@ -13,24 +13,30 @@ That is all you get. No diagnosis. Diagnose it yourself.
 
 ## 2. The API (your only window into the link)
 
-Start the simulator (instructor runs it, or run yourself):
-
-```bash
-python3 sat_api.py --port 8765
-```
+Base URL: `https://sposc-lab1.onrender.com`
+Each student gets an isolated simulator: always use your own ID (e.g. Neptun code, lowercase).
+Use it on every call, otherwise you share the `shared` session with anyone who forgot their ID.
 
 Get status (repeat as often as you like):
 
 ```bash
-curl -s localhost:8765/status | python3 -m json.tool
+curl -s "https://sposc-lab1.onrender.com/status?student=YOUR_ID" | python3 -m json.tool
 ```
 
-Send a control command:
+Send a control command (ID goes inside the JSON):
 
 ```bash
-curl -s -X POST localhost:8765/control \
+curl -s -X POST https://sposc-lab1.onrender.com/control \
   -H 'Content-Type: application/json' \
-  -d '{"cmd":"set_hpa","value":80}'
+  -d '{"student":"YOUR_ID","cmd":"set_hpa","value":80}'
+```
+
+Reset your own session to baseline (does not affect others):
+
+```bash
+curl -s -X POST https://sposc-lab1.onrender.com/control \
+  -H 'Content-Type: application/json' \
+  -d '{"student":"YOUR_ID","cmd":"reset"}'
 ```
 
 Allowed `cmd` values:
@@ -45,11 +51,13 @@ Allowed `cmd` values:
 | `set_pep` | `1` / `0` | Performance Enhancing Proxy on/off |
 | `set_link_arq` | `1` / `0` | link-layer ARQ on/off |
 | `repoint` | — | repoint ground antenna |
-| `reboot` | — | reboot payload (8 s outage) |
+| `reboot` | — | reboot payload (8 s outage, your session only) |
 | `set_payload_mode` | `BENT` / `REGEN` | payload processing mode |
+| `reset` | — | reset YOUR session to baseline |
 
-The API replies `{"ack": ..., "thr_mbps": ..., "result": "DEGRADED"|"NOMINAL"}`.
+The API replies `{"ack": ..., "thr_mbps": ..., "result": "DEGRADED"|"NOMINAL", "student": "your_id"}`.
 It will **not** tell you what is wrong. `NOMINAL` (≥ 35 Mbps) means you fixed it.
+Always check the `student` field in replies — if it is not your ID, you forgot to send it.
 
 ## 3. What the shift log says (unverified rumors — trust numbers, not stories)
 
