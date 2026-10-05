@@ -17,27 +17,44 @@ Base URL: `https://sposc-lab1.onrender.com`
 Each student gets an isolated simulator: always use your own ID (e.g. Neptun code, lowercase).
 Use it on every call, otherwise you share the `shared` session with anyone who forgot their ID.
 
-Get status (repeat as often as you like):
+There is NO single dump of all telemetry. Like a real SCC, you pick a diagnostic tool,
+form a hypothesis first, then query. Pasting one JSON blob into a chatbot will not solve this.
+
+Step 1 — symptom (free, repeat any time):
 
 ```bash
 curl -s "https://sposc-lab1.onrender.com/status?student=YOUR_ID" | python3 -m json.tool
 ```
+Returns only `thr_mbps` + `result` (+ your `controls_used`). No RF or TCP numbers.
 
-Send a control command (ID goes inside the JSON):
+Step 2 — pick a diagnostic tool based on your hypothesis:
+
+```bash
+curl -s "https://sposc-lab1.onrender.com/tools/rf?student=YOUR_ID" | python3 -m json.tool
+curl -s "https://sposc-lab1.onrender.com/tools/tcp?student=YOUR_ID" | python3 -m json.tool
+```
+- `/tools/rf` = spectrum analyzer + demod stats (frequency, power, MODCOD, C/N, Eb/N0, BER, G/T, bandwidth).
+- `/tools/tcp` = TCP trace (RTT, window, SACK, PEP, link ARQ).
+
+Step 3 — intervene. Every command MUST carry your hypothesis in `rationale`
+(min 15 characters), or it is rejected. It is logged and graded.
 
 ```bash
 curl -s -X POST https://sposc-lab1.onrender.com/control \
   -H 'Content-Type: application/json' \
-  -d '{"student":"YOUR_ID","cmd":"set_hpa","value":80}'
+  -d '{"student":"YOUR_ID","cmd":"set_hpa","value":80,"rationale":"testing if link is power-limited before touching transport"}'
 ```
 
-Reset your own session to baseline (does not affect others):
+Reset your own session to baseline (does not affect others, needs no rationale):
 
 ```bash
 curl -s -X POST https://sposc-lab1.onrender.com/control \
   -H 'Content-Type: application/json' \
   -d '{"student":"YOUR_ID","cmd":"reset"}'
 ```
+
+Budget: 30 control commands per student (reset excluded, reset does NOT refill it).
+Full marks require ≤ 8 with a real hypothesis each. Blind scripts will burn the budget.
 
 Allowed `cmd` values:
 
@@ -70,14 +87,14 @@ Always check the `student` field in replies — if it is not your ID, you forgot
 
 ## 4. Your tasks (90 min)
 
-1. **Baseline (15 min).** `GET /status`. Record every field. Compute:
-   - Free-space path loss at 12.2 GHz / 35,786 km. Is the path loss the problem?
-   - Bandwidth-Delay Product (BDP) from observed RTT and contracted rate. Compare BDP against the reported TCP window.
-   - Link-budget check: is `C/N`, `Eb/N0`, `BER`, `G/T`, `bw_used vs bw_alloc`, `hpa_pct` healthy or not?
+1. **Baseline (15 min).** Query `/status` (symptom), then pick ONE tool at a time based on a hypothesis — `/tools/rf` for a PHY hypothesis, `/tools/tcp` for a transport one. Record every field you pull. Compute:
+   - Free-space path loss at 12.2 GHz / 35,786 km (needs `orbit_km` + `freq_ghz` from `/tools/rf`). Is the path loss the problem?
+   - Bandwidth-Delay Product (BDP) from observed RTT and contracted rate (needs `rtt_ms` from `/tools/tcp`). Compare BDP against the reported TCP window.
+   - Link-budget check (needs `/tools/rf`): is `C/N`, `Eb/N0`, `BER`, `G/T`, `bw_used vs bw_alloc`, `hpa_pct` healthy or not?
    - Classify: power-limited? bandwidth-limited? Neither?
 2. **Map to layers (15 min).** For each candidate fix in the table above, state which segment (space / ground / control) and which OSI layer (PHY / link / network / transport) it acts on. Which layer do your numbers actually implicate?
-3. **Intervene (45 min).** You have a limited power and spectrum budget — every command is logged and graded. Propose a hypothesis, send ONE command, re-measure, record. Repeat. Reach `NOMINAL`.
-   - There are ~10 plausible actions. Only **one combination** restores the contract. The rest do nothing or make it worse. Brute-forcing without a hypothesis will be penalized.
+3. **Intervene (45 min).** You have 30 commands and every one needs a `rationale` — it is logged and graded. Propose a hypothesis, send ONE command, re-measure with the right tool, record. Repeat. Reach `NOMINAL`.
+   - There are ~10 plausible actions. Only **one combination** restores the contract. The rest do nothing or make it worse. Brute-forcing without a hypothesis is rejected by the API and penalized in grading.
 4. **Report (15 min, 1 page max).** Submit:
    - Initial status dump + your three calculations from (1).
    - Command log with hypothesis → result for each attempt.
@@ -89,6 +106,10 @@ Always check the `student` field in replies — if it is not your ID, you forgot
 - Do not read `sat_api.py`. Treating it as the answer key is a fail.
 - Do not assume the fault is where the rumors say it is.
 - A healthy `C/N` with a sick throughput is data, not a contradiction. Think layers.
+- AI tools are permitted, but a single paste cannot solve this: telemetry is split across
+  tools and every command needs your own stated hypothesis. An AI that tells you *what
+  to measure next* is being used well; one you ask for the final answer will guess.
+- Use only YOUR student ID; solving in another session does not count.
 
 ## Grading (10 pts)
 

@@ -3,12 +3,15 @@
 SAT-1 Link Simulator — Chapter 1 Lab
 GEO bent-pipe, Ku-band. Hidden fault is TRANSPORT (BDP), not RF.
 Run: python3 sat_api.py [--port 8765]
-  GET  /status?student=ID  -> minimal telemetry (intentionally terse)
-  POST /control             -> {"cmd": "...", "value": ..., "student": "ID"}
+  GET  /status?student=ID      -> symptom only (thr_mbps, result)
+  GET  /tools/rf?student=ID    -> RF/PHY diagnostics (demod + spectrum)
+  GET  /tools/tcp?student=ID   -> transport diagnostics (RTT, window, SACK/PEP/ARQ)
+  POST /control                -> {"cmd": "...", "value": ..., "student": "ID", "rationale": "why (min 15 chars)"}
 Per-student isolation: each student ID gets its own simulator state on the
 same shared Render service, so one student solving does not solve it for others.
 Omit student -> shared fallback session ("shared").
-No hints are returned. Students must diagnose from numbers.
+Control budget: 30 mutating commands per student (reset excluded, survives reset).
+No full-state dump exists: diagnosis must be earned tool by tool.
 """
 import argparse
 import copy
@@ -65,6 +68,22 @@ def reset_state(sid):
         SESSIONS[sid] = fresh_state()
         SESSIONS_LAST[sid] = time.time()
         return sid, SESSIONS[sid]
+
+# Anti-brute-force budgets (per student, survives session reset).
+CONTROL_USED = {}
+CONTROL_LOCK = threading.Lock()
+MAX_CONTROLS = 30     # hard cap on mutating commands per student (grading needs <=8 for full marks)
+MIN_RATIONALE = 15    # min chars of hypothesis required on every mutating command
+
+def control_used(sid):
+    with CONTROL_LOCK:
+        return CONTROL_USED.get(normalize_sid(sid), 0)
+
+def bump_controls(sid):
+    sid = normalize_sid(sid)
+    with CONTROL_LOCK:
+        CONTROL_USED[sid] = CONTROL_USED.get(sid, 0) + 1
+        return CONTROL_USED[sid]
 
 # MODCOD table: (capacity_mbps on 36MHz, required Eb/N0 dB)
 MODCODS = {
@@ -197,35 +216,54 @@ class H(BaseHTTPRequestHandler):
         if path == "/":
             # Health check for Render / load balancers
             return self._send({"ok": True, "service": "sat-1-simulator"})
-        if path != "/status":
-            return self._send({"error": "unknown endpoint. use /status or /control"}, 404)
-        sid, s = get_state(self._sid_from_get())
-        c_n, eb_n0, ber, rtt, cap = current_physics(s)
-        thr = current_throughput(s)
-        bw_used = min(36.0, thr / MODCODS[s["modcod"]][0] * 36.0 * 0.95 + 1.2)
-        # Intentionally minimal. No diagnosis, no units lecture, no hints.
-        self._send({
-            "link": "GW2<>GEO1<>VSAT7",
-            "student": sid,
-            "payload": s["payload"],
-            "orbit_km": s["orbit_km"],
-            "freq_ghz": s["freq_ghz"],
-            "rtt_ms": rtt if time.time() >= s["down_until"] else 0,
-            "c_n_db": c_n,
-            "eb_n0_db": eb_n0,
-            "ber": ber,
-            "g_t": BASE_GT,
-            "hpa_pct": s["hpa_pct"],
-            "bw_alloc_mhz": 36,
-            "bw_used_mhz": round(bw_used, 1),
-            "modcod": s["modcod"],
-            "thr_mbps": thr,
-            "tcp_win_kb": s["tcp_win_kb"],
-            "sack": s["sack"],
-            "pep": s["pep"],
-            "link_arq": s["link_arq"],
-            "result": link_state_label(thr),
-        })
+        if path == "/status":
+            # Symptom only: throughput + verdict. No diagnostic numbers here by design —
+            # use /tools/rf and /tools/tcp to earn the diagnosis in stages.
+            sid, s = get_state(self._sid_from_get())
+            thr = current_throughput(s)
+            return self._send({
+                "link": "GW2<>GEO1<>VSAT7",
+                "student": sid,
+                "thr_mbps": thr,
+                "result": link_state_label(thr),
+                "controls_used": control_used(sid),
+                "tools": ["/tools/rf", "/tools/tcp"],
+            })
+        if path == "/tools/rf":
+            # Virtual spectrum analyzer + demod stats (RF / PHY domain).
+            sid, s = get_state(self._sid_from_get())
+            c_n, eb_n0, ber, rtt, cap = current_physics(s)
+            thr = current_throughput(s)
+            bw_used = min(36.0, thr / MODCODS[s["modcod"]][0] * 36.0 * 0.95 + 1.2)
+            return self._send({
+                "tool": "rf",
+                "student": sid,
+                "payload": s["payload"],
+                "orbit_km": s["orbit_km"],
+                "freq_ghz": s["freq_ghz"],
+                "c_n_db": c_n,
+                "eb_n0_db": eb_n0,
+                "ber": ber,
+                "g_t": BASE_GT,
+                "hpa_pct": s["hpa_pct"],
+                "modcod": s["modcod"],
+                "bw_alloc_mhz": 36,
+                "bw_used_mhz": round(bw_used, 1),
+            })
+        if path == "/tools/tcp":
+            # Virtual TCP trace (transport domain).
+            sid, s = get_state(self._sid_from_get())
+            _, _, _, rtt, _ = current_physics(s)
+            return self._send({
+                "tool": "tcp",
+                "student": sid,
+                "rtt_ms": rtt if time.time() >= s["down_until"] else 0,
+                "tcp_win_kb": s["tcp_win_kb"],
+                "sack": s["sack"],
+                "pep": s["pep"],
+                "link_arq": s["link_arq"],
+            })
+        return self._send({"error": "unknown endpoint. use /status, /tools/rf, /tools/tcp or /control"}, 404)
 
     def do_POST(self):
         if urlparse(self.path).path != "/control":
@@ -249,11 +287,20 @@ class H(BaseHTTPRequestHandler):
             raw_sid = self.headers.get("X-Student-ID", "shared")
         cmd = str(body.get("cmd", "")).strip().lower()
         val = body.get("value", None)
+        rationale = body.get("rationale", body.get("hypothesis", ""))
         if cmd == "reset":
             sid, s = reset_state(raw_sid)
             return self._send({"ack": f"session {sid} reset to baseline", "thr_mbps": current_throughput(s), "result": link_state_label(current_throughput(s)), "student": sid})
+        # Hypothesis-first: every mutating command must carry the student's reasoning.
+        # This is graded (commands_log keeps it) and blocks blind copy-paste scripts.
+        if not isinstance(rationale, str) or len(rationale.strip()) < MIN_RATIONALE:
+            sid = normalize_sid(raw_sid)
+            return self._send({"error": f"rationale required: include 'rationale' with your hypothesis (min {MIN_RATIONALE} chars) explaining why this command helps", "student": sid}, 400)
         sid, s = get_state(raw_sid)
-        s["commands_log"].append({"cmd": cmd, "value": val, "t": time.time()})
+        used = bump_controls(sid)
+        if used > MAX_CONTROLS:
+            return self._send({"error": f"control budget exhausted ({MAX_CONTROLS} commands per student). Reset does not refill it — review your hypothesis log.", "student": sid}, 429)
+        s["commands_log"].append({"cmd": cmd, "value": val, "rationale": rationale.strip(), "t": time.time()})
         msg = ""
 
         if cmd == "set_hpa":
@@ -311,7 +358,7 @@ class H(BaseHTTPRequestHandler):
             return self._send({"error": f"unknown cmd. options: {opts}"}, 400)
 
         thr = current_throughput(s)
-        self._send({"ack": msg, "thr_mbps": thr, "result": link_state_label(thr), "student": sid})
+        self._send({"ack": msg, "thr_mbps": thr, "result": link_state_label(thr), "student": sid, "controls_used": control_used(sid)})
 
 if __name__ == "__main__":
     # Render injects $PORT (e.g. 10000). Use it by default, allow --port override.

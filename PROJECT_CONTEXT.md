@@ -20,11 +20,18 @@ GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
 ## Render contract (keep this to stay deployable)
 1. Bind `0.0.0.0` + port from `$PORT`: `default_port = int(os.environ.get("PORT", "8765"))`
 2. `GET /` returns `{"ok": True}` — Render health checks hit `/`
-3. `GET /status` is the healthCheckPath in `render.yaml`
+3. `GET /status` is the healthCheckPath in `render.yaml` (must stay 200 + JSON without params breaking it)
 4. CORS headers on every response (`Access-Control-Allow-Origin: *` + `do_OPTIONS`) — students use browser fetch
 5. No external deps, no files, no DB — state is in-memory `SESSIONS` dict (one `fresh_state()` per student); Render restart wipes all sessions
 6. No secrets in code/env needed; `print(..., flush=True)` so Render logs show startup
 7. Free tier sleeps after idle (~50s cold start) — warn students to retry once
+
+## Anti-AI-friction design (do not regress this)
+- `/status` = symptom only (`thr_mbps`, `result`, `controls_used`, tool list). NEVER add diagnostic fields back.
+- `/tools/rf` = PHY domain (payload, orbit, freq, C/N, Eb/N0, BER, G/T, HPA, MODCOD, bw). `/tools/tcp` = transport (RTT, window, SACK, PEP, ARQ).
+- `POST /control` requires `rationale`/`hypothesis` (min `MIN_RATIONALE=15` chars) on mutating cmds; logged in `commands_log`; `reset` exempt.
+- Budgets: `MAX_CONTROLS=30` mutating cmds per student via `CONTROL_USED` (survives `reset`); grading demands ≤8 for full marks.
+- Physics (`current_physics(s)` / `current_throughput(s)`) unchanged — same hidden fault, same solve path.
 
 ## Session model (per-student isolation)
 - `SESSIONS: dict[sid -> state]` + `fresh_state()` factory; `get_state(sid)` / `reset_state(sid)` under `SESSIONS_LOCK`
