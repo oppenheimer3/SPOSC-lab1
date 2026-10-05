@@ -1,0 +1,2 @@
+# No external dependencies — stdlib only (http.server, argparse)
+# File kept so Render detects a Python service.

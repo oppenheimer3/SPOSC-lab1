@@ -1,0 +1,4 @@
+INSTRUCTOR_KEY.md
+__pycache__/
+*.pyc
+.venv/

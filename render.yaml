@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: sat-1-sim
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python sat_api.py
+    healthCheckPath: /status
+    autoDeploy: true
