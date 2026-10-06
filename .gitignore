@@ -1,4 +1,8 @@
 INSTRUCTOR_KEY.md
+instructor_report.py
+results.jsonl
+satlab.db*
 __pycache__/
 *.pyc
 .venv/
+.player

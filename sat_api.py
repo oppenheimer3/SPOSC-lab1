@@ -11,6 +11,8 @@ Run: python3 sat_api.py [--port 8765]
   GET  /tools/tcp?student=ID   -> transport filtered view
   GET  /tools/ttc?student=ID   -> TT&C filtered view
   POST /control                -> {"cmd": "...", "value": ..., "student": "ID"}
+  GET  /report?student=ID      -> own progress (stage, config, command log)
+  GET  /report/all?key=KEY     -> whole-class results (instructor only, needs REPORT_KEY env)
 Per-student isolation: each student ID gets its own simulator state on the
 same shared Render service, so one student solving does not solve it for others.
 Omit student -> shared fallback session ("shared").
@@ -19,6 +21,10 @@ Reach status "up" (thr >= 35 Mbps) to clear the outage.
 Game guidance lives in the API, not the handout: /status always returns a
 'hint' for the current stage, and /control returns a 'message' exactly when
 a stage is cleared (final clear = success message).
+Results persist in SQLite (DB_PATH env, default ./satlab.db): every mutation
+is written through; sessions + budgets are reloaded on boot. A cloud mirror
+(Upstash Redis via REST, UPSTASH_URL + UPSTASH_TOKEN env) survives even a full
+disk wipe; everything fails open to in-memory play.
 """
 import argparse
 import copy
@@ -26,8 +32,10 @@ import json
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -61,12 +69,32 @@ def normalize_sid(raw):
 def get_state(sid):
     sid = normalize_sid(sid)
     with SESSIONS_LOCK:
-        if sid not in SESSIONS:
-            if len(SESSIONS) >= MAX_SESSIONS:
-                oldest = min(SESSIONS_LAST, key=SESSIONS_LAST.get)
-                SESSIONS.pop(oldest, None)
-                SESSIONS_LAST.pop(oldest, None)
+        if sid in SESSIONS:
+            SESSIONS_LAST[sid] = time.time()
+            return sid, SESSIONS[sid]
+        if len(SESSIONS) >= MAX_SESSIONS:
+            oldest = min(SESSIONS_LAST, key=SESSIONS_LAST.get)
+            SESSIONS.pop(oldest, None)
+            SESSIONS_LAST.pop(oldest, None)
+        restored = db_load_session(sid)  # transparent after restart/eviction
+        if restored is not None:
+            SESSIONS[sid], CONTROL_USED[sid] = restored
+        else:
             SESSIONS[sid] = fresh_state()
+        SESSIONS_LAST[sid] = time.time()
+        miss = restored is None
+    if miss:
+        # Outside the lock (slow I/O): full disk wipe? restore from the cloud.
+        cloud = cloud_load_session(sid)
+        if cloud is not None:
+            state, used, logrows = cloud
+            state["commands_log"] = logrows  # full audit history (superset of post-reset log)
+            with SESSIONS_LOCK:
+                SESSIONS[sid] = state  # cloud wins: it holds the authoritative history
+                CONTROL_USED[sid] = used
+                SESSIONS_LAST[sid] = time.time()
+            db_save_session(sid)  # refill the local cache
+    with SESSIONS_LOCK:
         SESSIONS_LAST[sid] = time.time()
         return sid, SESSIONS[sid]
 
@@ -76,6 +104,10 @@ def reset_state(sid):
         SESSIONS[sid] = fresh_state()
         SESSIONS_LAST[sid] = time.time()
         return sid, SESSIONS[sid]
+
+# Instructor results: whole-class view at GET /report/all is gated by this key.
+# Set REPORT_KEY in the Render dashboard (Environment); never share it with students.
+REPORT_KEY = os.environ.get("REPORT_KEY", "")
 
 # Anti-brute-force budgets (per student, survives session reset).
 CONTROL_USED = {}
@@ -91,6 +123,205 @@ def bump_controls(sid):
     with CONTROL_LOCK:
         CONTROL_USED[sid] = CONTROL_USED.get(sid, 0) + 1
         return CONTROL_USED[sid]
+
+# Persistence (SQLite, stdlib only): every mutation is written through, so results
+# survive a process crash/restart as long as the DB file survives with the disk.
+# Path from DB_PATH (default ./satlab.db). Every DB error fails open — the game
+# keeps running in memory and the failure is only logged.
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "satlab.db"))
+DB = None
+DB_LOCK = threading.Lock()
+
+def db_init():
+    """Open DB, create tables, rehydrate in-memory sessions (called once at boot)."""
+    global DB
+    try:
+        DB = sqlite3.connect(DB_PATH, check_same_thread=False)
+        DB.execute("PRAGMA journal_mode=WAL")
+        DB.execute("PRAGMA synchronous=NORMAL")
+        DB.execute("""CREATE TABLE IF NOT EXISTS sessions(
+            student TEXT PRIMARY KEY, state_json TEXT NOT NULL,
+            controls_used INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL)""")
+        DB.execute("""CREATE TABLE IF NOT EXISTS commands(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT NOT NULL,
+            cmd TEXT NOT NULL, value TEXT, t REAL NOT NULL)""")
+        DB.execute("CREATE INDEX IF NOT EXISTS idx_commands_student ON commands(student)")
+        DB.commit()
+        n = 0
+        with SESSIONS_LOCK:
+            for sid, state_json, used in DB.execute("SELECT student, state_json, controls_used FROM sessions"):
+                try:
+                    SESSIONS[sid] = json.loads(state_json)
+                    CONTROL_USED[sid] = int(used)
+                    SESSIONS_LAST[sid] = time.time()
+                    n += 1
+                except Exception:
+                    continue
+        print(f"persistence: {DB_PATH} ({n} sessions restored)", flush=True)
+    except Exception as e:  # noqa: BLE001 - fail open, game works in-memory
+        print(f"persistence disabled ({e}); running in-memory only", flush=True)
+        DB = None
+
+def db_save_session(sid):
+    """Upsert one student's full state + budget (mirrors in-memory exactly)."""
+    if DB is None:
+        return
+    try:
+        with SESSIONS_LOCK:
+            s = SESSIONS.get(sid)
+            snap = copy.deepcopy(s) if s is not None else None
+            used = CONTROL_USED.get(sid, 0)
+        if snap is None:
+            return
+        with DB_LOCK:
+            DB.execute("INSERT INTO sessions(student, state_json, controls_used, updated)"
+                       " VALUES(?,?,?,?) ON CONFLICT(student) DO UPDATE SET"
+                       " state_json=excluded.state_json, controls_used=excluded.controls_used,"
+                       " updated=excluded.updated",
+                       (sid, json.dumps(snap), used, time.time()))
+            DB.commit()
+    except Exception as e:  # noqa: BLE001 - fail open
+        print(f"db save failed: {e}", flush=True)
+
+def db_log_command(sid, cmd, val):
+    """Append one row to the audit log."""
+    if DB is None:
+        return
+    try:
+        with DB_LOCK:
+            DB.execute("INSERT INTO commands(student, cmd, value, t) VALUES(?,?,?,?)",
+                       (sid, cmd, json.dumps(val), time.time()))
+            DB.commit()
+    except Exception as e:  # noqa: BLE001 - fail open
+        print(f"db log failed: {e}", flush=True)
+
+def db_load_session(sid):
+    """Return (state, controls_used) for an evicted/restarted session, else None."""
+    if DB is None:
+        return None
+    try:
+        with DB_LOCK:
+            row = DB.execute("SELECT state_json, controls_used FROM sessions WHERE student=?",
+                             (sid,)).fetchone()
+        if not row:
+            return None
+        return json.loads(row[0]), int(row[1])
+    except Exception:  # noqa: BLE001 - fail open
+        return None
+
+# Cloud mirror (Upstash Redis via REST, stdlib urllib only): survives even a full
+# Render wipe (memory + SQLite file gone). Set UPSTASH_URL + UPSTASH_TOKEN in the
+# Render dashboard (Environment). Every call fails open with a short timeout —
+# the game never depends on the cloud answering.
+UPSTASH_URL = os.environ.get("UPSTASH_URL", "").rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN", "")
+UPSTASH_TIMEOUT = 4
+CLOUD_PREFIX = "sat1"
+
+def upstash_pipeline(cmds):
+    """Run [[CMD, args...], ...] via REST /pipeline. Returns results list or None."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return None
+    try:
+        req = urllib.request.Request(
+            UPSTASH_URL + "/pipeline",
+            data=json.dumps(cmds).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=UPSTASH_TIMEOUT) as r:
+            return json.load(r)
+    except Exception:  # noqa: BLE001 - fail open
+        return None
+
+def cloud_persist(sid, cmd, val):
+    """One REST call: snapshot current state + append audit row."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return
+    try:
+        with SESSIONS_LOCK:
+            s = SESSIONS.get(sid)
+            snap = copy.deepcopy(s) if s is not None else None
+            used = CONTROL_USED.get(sid, 0)
+        if snap is None:
+            return
+        upstash_pipeline([
+            ["SET", f"{CLOUD_PREFIX}:sess:{sid}",
+             json.dumps({"state": snap, "used": used})],
+            ["RPUSH", f"{CLOUD_PREFIX}:log:{sid}",
+             json.dumps({"cmd": cmd, "value": val, "t": time.time()})],
+        ])
+    except Exception:  # noqa: BLE001 - fail open
+        pass
+
+def cloud_save_session(sid):
+    """Snapshot current state (no audit row)."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return
+    try:
+        with SESSIONS_LOCK:
+            s = SESSIONS.get(sid)
+            snap = copy.deepcopy(s) if s is not None else None
+            used = CONTROL_USED.get(sid, 0)
+        if snap is None:
+            return
+        upstash_pipeline([
+            ["SET", f"{CLOUD_PREFIX}:sess:{sid}",
+             json.dumps({"state": snap, "used": used})],
+        ])
+    except Exception:  # noqa: BLE001 - fail open
+        pass
+
+def cloud_load_session(sid):
+    """Return (state, used, logrows) from the cloud, or None. Log = full audit history."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return None
+    try:
+        res = upstash_pipeline([
+            ["GET", f"{CLOUD_PREFIX}:sess:{sid}"],
+            ["LRANGE", f"{CLOUD_PREFIX}:log:{sid}", 0, -1],
+        ])
+        if not res or not res[0].get("result"):
+            return None
+        payload = json.loads(res[0]["result"])
+        state, used = payload.get("state"), int(payload.get("used", 0))
+        if not isinstance(state, dict) or "modcod" not in state:
+            return None
+        logrows = []
+        for raw in res[1].get("result") or []:
+            try:
+                row = json.loads(raw)
+                if isinstance(row, dict) and "cmd" in row:
+                    logrows.append(row)
+            except Exception:
+                continue
+        return state, used, logrows
+    except Exception:  # noqa: BLE001 - fail open
+        return None
+
+def cloud_students():
+    """All sids ever stored (for /report/all after a cold start)."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return []
+    out = []
+    try:
+        cursor = "0"
+        for _ in range(50):
+            res = upstash_pipeline([
+                ["SCAN", cursor, "MATCH", f"{CLOUD_PREFIX}:sess:*", "COUNT", "200"],
+            ])
+            if not res:
+                break
+            cursor, keys = res[0].get("result", ["0", []])
+            for k in keys or []:
+                sid = normalize_sid(k.rsplit(":", 1)[-1])
+                if sid and sid not in out:
+                    out.append(sid)
+            if str(cursor) == "0":
+                break
+    except Exception:  # noqa: BLE001 - fail open
+        pass
+    return out
 
 # MODCOD table: (capacity_mbps on 36MHz, required Eb/N0 dB)
 MODCODS = {
@@ -318,6 +549,28 @@ def full_status(sid, s):
         resp["message"] = SUCCESS_MSG
     return resp
 
+def student_report(sid, s):
+    """Progress summary for results: stage, score inputs, final config, full command log."""
+    thr = current_throughput(s)
+    return {
+        "student": sid,
+        "stage": link_stage(s),
+        "status": link_state_label(thr),
+        "thr_mbps": thr,
+        "solved": thr >= 35.0,
+        "controls_used": control_used(sid),
+        "config": {
+            "hpa_pct": s["hpa_pct"],
+            "modcod": s["modcod"],
+            "freq_ghz": s["freq_ghz"],
+            "tcp_win_kb": s["tcp_win_kb"],
+            "sack": s["sack"],
+            "pep": s["pep"],
+            "antenna_ok": s.get("antenna_ok"),
+        },
+        "commands_log": s["commands_log"],
+    }
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -412,16 +665,86 @@ class H(BaseHTTPRequestHandler):
                 "payload_health": "NOMINAL",
                 "note": "bent-pipe: no onboard demod/remod",
             })
+        if path == "/report":
+            # Own progress incl. command log (any student can check their own run).
+            sid, s = get_state(self._sid_from_get())
+            return self._send(student_report(sid, s))
+        if path == "/report/all":
+            # Whole-class results for the instructor. Gated by REPORT_KEY env var
+            # (set it in the Render dashboard; never share it with students).
+            if not REPORT_KEY:
+                return self._send({"error": "instructor: set REPORT_KEY env var on the server first"}, 403)
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                want = (q.get("key") or [""])[0]
+            except Exception:
+                want = ""
+            if want != REPORT_KEY:
+                return self._send({"error": "wrong key"}, 403)
+            with SESSIONS_LOCK:
+                sids = sorted(SESSIONS.keys())
+            for rid in cloud_students():  # sessions known only to the cloud (cold start)
+                if rid not in sids:
+                    sids.append(rid)
+            sids.sort()
+            out = []
+            for rid in sids:
+                _, rs = get_state(rid)  # lazily restores from cloud on miss
+                out.append(student_report(rid, rs))
+            return self._send({"count": len(out), "reports": out})
         return self._send({"error": "unknown endpoint. use /status, /tools/rf, /tools/tcp, /tools/ttc or /control"}, 404)
 
     def do_POST(self):
-        if urlparse(self.path).path != "/control":
-            return self._send({"error": "unknown endpoint. use /status or /control"}, 404)
+        rpath = urlparse(self.path).path
         try:
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n).decode() or "{}")
         except Exception:
             return self._send({"error": "bad JSON"}, 400)
+        if rpath == "/wipe":
+            # Instructor: clear everything (memory + SQLite + cloud) between groups.
+            # Same key as /report/all. POST only.
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                want = (body.get("key", "") if isinstance(body, dict) else "")
+                if not want:
+                    want = (q.get("key") or [""])[0]
+            except Exception:
+                want = ""
+            if not REPORT_KEY or want != REPORT_KEY:
+                return self._send({"error": "wrong key"}, 403)
+            with SESSIONS_LOCK:
+                SESSIONS.clear()
+                SESSIONS_LAST.clear()
+            with CONTROL_LOCK:
+                CONTROL_USED.clear()
+            if DB is not None:
+                try:
+                    with DB_LOCK:
+                        DB.execute("DELETE FROM sessions")
+                        DB.execute("DELETE FROM commands")
+                        DB.commit()
+                except Exception:
+                    pass
+            try:
+                cursor = "0"
+                for _ in range(50):
+                    res = upstash_pipeline([
+                        ["SCAN", cursor, "MATCH", f"{CLOUD_PREFIX}:*", "COUNT", "500"],
+                    ])
+                    if not res:
+                        break
+                    cursor, keys = res[0].get("result", ["0", []])
+                    keys = keys or []
+                    for i in range(0, len(keys), 100):
+                        upstash_pipeline([["DEL"] + keys[i:i + 100]])
+                    if str(cursor) == "0":
+                        break
+            except Exception:
+                pass
+            return self._send({"wiped": True})
+        if rpath != "/control":
+            return self._send({"error": "unknown endpoint. use /status or /control"}, 404)
         raw_sid = body.get("student", body.get("id", body.get("sid", None)))
         if raw_sid is None:
             try:
@@ -438,6 +761,9 @@ class H(BaseHTTPRequestHandler):
         val = body.get("value", None)
         if cmd == "reset":
             sid, s = reset_state(raw_sid)
+            db_save_session(sid)
+            db_log_command(sid, "reset", None)
+            cloud_persist(sid, "reset", None)
             thr = current_throughput(s)
             stage = link_stage(s)
             resp = {"ack": f"session {sid} reset to baseline", "thr_mbps": thr,
@@ -452,6 +778,9 @@ class H(BaseHTTPRequestHandler):
         if used > MAX_CONTROLS:
             return self._send({"error": f"control budget exhausted ({MAX_CONTROLS} commands per student). Reset does not refill it.", "student": sid}, 429)
         s["commands_log"].append({"cmd": cmd, "value": val, "t": time.time()})
+        db_save_session(sid)
+        db_log_command(sid, cmd, val)
+        cloud_persist(sid, cmd, val)
         msg = ""
 
         if cmd == "set_hpa":
@@ -511,6 +840,8 @@ class H(BaseHTTPRequestHandler):
 
         thr = current_throughput(s)
         stage_after = link_stage(s)
+        db_save_session(sid)  # second save: snapshot now includes this command's effect
+        cloud_save_session(sid)
         resp = {"ack": msg, "thr_mbps": thr, "status": link_state_label(thr),
                 "stage": stage_after, "student": sid, "controls_used": control_used(sid),
                 "hint": STAGE_HINTS[stage_after]}
@@ -531,5 +862,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=default_port)
     a = ap.parse_args()
+    db_init()
+    print(f"cloud mirror: {'on' if UPSTASH_URL and UPSTASH_TOKEN else 'off (set UPSTASH_URL + UPSTASH_TOKEN)'}",
+          flush=True)
     print(f"SAT-1 simulator on :{a.port}  (GET /status, POST /control)", flush=True)
     ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()

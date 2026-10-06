@@ -52,21 +52,43 @@ def parse_value(raw):
     return raw
 
 
-def ask_student_id():
-    preset = os.environ.get("NAME", os.environ.get("STUDENT_ID", "")).strip()
+def resolve_name(cli_name=None):
+    """Ask for the name only once: --name > $NAME/$STUDENT_ID > saved .player file > prompt (then save)."""
     try:
-        if preset:
-            ans = input(f"Your name [{preset}]: ").strip()
-            return ans or preset
-        ans = input("Your name: ").strip()
-    except EOFError:
-        if preset:
-            return preset
-        ans = ""
-    if not ans:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        base = os.getcwd()
+    path = os.path.join(base, ".player")
+    if cli_name and cli_name.strip():
+        name = cli_name.strip()
+        try:
+            with open(path, "w") as f:
+                f.write(name + "\n")
+        except OSError:
+            pass
+        return name
+    name = os.environ.get("NAME", "").strip() or os.environ.get("STUDENT_ID", "").strip()
+    if not name:
+        try:
+            with open(path) as f:
+                name = f.read().strip()
+        except OSError:
+            name = ""
+    if not name:
+        try:
+            name = input("Your name (asked once, then remembered): ").strip()
+        except EOFError:
+            name = ""
+        if name:
+            try:
+                with open(path, "w") as f:
+                    f.write(name + "\n")
+            except OSError:
+                pass
+    if not name:
         print("No name given, using the 'shared' session.", file=sys.stderr)
         return "shared"
-    return ans
+    return name
 
 
 def main():
@@ -84,8 +106,10 @@ def main():
                     help="command to send (see list below)")
     ap.add_argument("--value", default=None,
                     help="command value, e.g. 80, 12.2, 512, 1")
+    ap.add_argument("--name", default=None,
+                    help="your name (saved, so you only type it once)")
     a = ap.parse_args()
-    a.student = ask_student_id()
+    a.student = resolve_name(a.name)
 
     body = {"student": a.student, "cmd": a.cmd}
     val = parse_value(a.value)

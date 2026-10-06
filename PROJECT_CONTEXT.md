@@ -41,6 +41,15 @@ GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
 - `POST {"cmd":"reset"}` resets only the caller's session; per-session `commands_log` keeps the audit trail
 - `/status` echoes `"student": sid` so students can verify they are on their own session
 
+## Results (instructor only, LOCAL files + server memory)
+- `GET /report?student=ID` — one student's progress: stage/status/thr, final config, full `commands_log`
+- `GET /report/all?key=KEY` — every session at once; gated by `REPORT_KEY` env var (set it in Render dashboard → Environment, never share it; unset = 403)
+- `instructor_report.py` (LOCAL ONLY, gitignored, never in students' folder): `REPORT_KEY=... python3 instructor_report.py [--verbose]` prints the class table
+- Persistence: SQLite write-through (`DB_PATH` env, default `./satlab.db`; tables `sessions` + `commands`); sessions + budgets rehydrate on boot, so a crash/restart loses nothing — as long as the DB file survives. Render free tier has an EPHEMERAL disk (redeploy/restart/sleep can wipe the file): for guaranteed survival either attach a Render Disk at `/data` + `DB_PATH=/data/satlab.db`, or run `instructor_report.py --watch 60 --out class.jsonl` on your machine during the lab (snapshots accumulate locally no matter what happens to the server)
+- Cloud mirror (Upstash Redis via REST, stdlib only): set `UPSTASH_URL` + `UPSTASH_TOKEN` in Render dashboard → Environment; every mutation is mirrored (1 REST call: state snapshot + audit row); on a total wipe sessions lazy-restore per student and `/report/all` finds them via SCAN; every call fails open (4s timeout, game never blocks). Setup: upstash.com → create free Redis DB → copy its REST URL + token. Class usage (~30 students × 15 cmds) is a tiny fraction of the free 500K cmds/mo
+- `POST /wipe` with instructor key (body or `?key=`, same `REPORT_KEY`): clears memory + SQLite + cloud between groups — restarts no longer wipe, so wipe explicitly
+- Name-once: scripts resolve `--name` > `$NAME`/`$STUDENT_ID` > saved `scripts/.player` file > prompt (then save); students type their name a single time
+
 ## Where the exercise logic lives (`sat_api.py`)
 - `fresh_state()` — outage baseline (256APSK, HPA 68, antenna misaligned, window 64, no PEP/SACK)
 - `MODCODS` — `(capacity_mbps, required_EbN0)`: QPSK_1/2 safe-but-capped (28), QPSK_3/4 sweet spot (42), higher orders die under rain (cliff effect)

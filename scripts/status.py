@@ -24,21 +24,43 @@ def fetch_status(base_url, student):
         return json.load(r)
 
 
-def ask_student_id():
-    preset = os.environ.get("NAME", os.environ.get("STUDENT_ID", "")).strip()
+def resolve_name(cli_name=None):
+    """Ask for the name only once: --name > $NAME/$STUDENT_ID > saved .player file > prompt (then save)."""
     try:
-        if preset:
-            ans = input(f"Your name [{preset}]: ").strip()
-            return ans or preset
-        ans = input("Your name: ").strip()
-    except EOFError:
-        if preset:
-            return preset
-        ans = ""
-    if not ans:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        base = os.getcwd()
+    path = os.path.join(base, ".player")
+    if cli_name and cli_name.strip():
+        name = cli_name.strip()
+        try:
+            with open(path, "w") as f:
+                f.write(name + "\n")
+        except OSError:
+            pass
+        return name
+    name = os.environ.get("NAME", "").strip() or os.environ.get("STUDENT_ID", "").strip()
+    if not name:
+        try:
+            with open(path) as f:
+                name = f.read().strip()
+        except OSError:
+            name = ""
+    if not name:
+        try:
+            name = input("Your name (asked once, then remembered): ").strip()
+        except EOFError:
+            name = ""
+        if name:
+            try:
+                with open(path, "w") as f:
+                    f.write(name + "\n")
+            except OSError:
+                pass
+    if not name:
         print("No name given, using the 'shared' session.", file=sys.stderr, flush=True)
         return "shared"
-    return ans
+    return name
 
 
 def main():
@@ -49,8 +71,10 @@ def main():
                     help="seconds between polls (default: 2.0)")
     ap.add_argument("--once", action="store_true",
                     help="print once and exit")
+    ap.add_argument("--name", default=None,
+                    help="your name (saved, so you only type it once)")
     a = ap.parse_args()
-    a.student = ask_student_id()
+    a.student = resolve_name(a.name)
 
     if a.student == "shared":
         print("WARNING: using the 'shared' session. Type your name for your own simulator.",
