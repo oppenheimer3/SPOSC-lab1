@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 SAT-1 Link Simulator — Chapter 1 Lab
-GEO bent-pipe, Ku-band. Hidden fault is TRANSPORT (BDP), not RF.
+GEO bent-pipe, Ku-band. STORM OUTAGE scenario: 3-stage restore.
+  Stage 1 (PHY/power): rain fade + antenna drift -> C/N below lock. Fix: repoint + HPA boost.
+  Stage 2 (PHY/MODCOD): 256APSK bandwidth-limited -> BER collapse. Fix: fallback QPSK_3/4 (QPSK_1/2 safe but slow).
+  Stage 3 (transport): BDP starvation, 64KB window vs ~500ms RTT. Fix: PEP + SACK + window>=2500.
 Run: python3 sat_api.py [--port 8765]
   GET  /status?student=ID      -> symptom only (thr_mbps, result)
   GET  /tools/rf?student=ID    -> RF/PHY diagnostics (demod + spectrum)
   GET  /tools/tcp?student=ID   -> transport diagnostics (RTT, window, SACK/PEP/ARQ)
+  GET  /tools/ttc?student=ID   -> TT&C / space segment (orbit, payload health)
   POST /control                -> {"cmd": "...", "value": ..., "student": "ID", "rationale": "why (min 15 chars)"}
 Per-student isolation: each student ID gets its own simulator state on the
 same shared Render service, so one student solving does not solve it for others.
@@ -30,11 +34,12 @@ def fresh_state():
         "orbit_km": 35786,
         "freq_ghz": 12.2,
         "hpa_pct": 68,
-        "modcod": "QPSK_3/4",
+        "modcod": "256APSK_9/10",
         "tcp_win_kb": 64,
         "sack": 0,
         "pep": 0,
         "link_arq": 0,
+        "antenna_ok": False,   # wind drift: needs `repoint`
         "reboots": 0,
         "commands_log": [],
         "down_until": 0.0,
@@ -87,22 +92,35 @@ def bump_controls(sid):
 
 # MODCOD table: (capacity_mbps on 36MHz, required Eb/N0 dB)
 MODCODS = {
-    "QPSK_3/4":    (42.0, 5.5),
-    "8PSK_5/6":    (68.0, 9.0),
-    "16APSK_5/6":  (90.0, 11.5),
+    "QPSK_1/2":     (28.0, 2.5),
+    "QPSK_3/4":     (42.0, 5.5),
+    "8PSK_5/6":     (68.0, 9.0),
+    "16APSK_5/6":   (90.0, 11.5),
     "256APSK_9/10": (135.0, 18.0),
 }
 
-BASE_EB_N0 = 8.1   # dB, healthy for QPSK_3/4 with 2.6 dB margin
-BASE_C_N = 12.4    # dB
+BASE_EB_N0 = 8.1   # dB, clear-sky reference for QPSK_3/4 with 2.6 dB margin
+BASE_C_N = 12.4    # dB, clear-sky reference
 BASE_GT = 21.5
 BASE_RTT_MS = 542
+RAIN_DB = 7.0        # severe localized storm cell (Ku-band absorption+scattering)
+POINT_LOSS_DB = 7.0  # wind drift: antenna misaligned, G/T degraded until `repoint`
+LOCK_CN_DB = 6.0     # modem C/N lock threshold — Stage-1 gate
 
 def current_physics(s):
     """Returns (c_n, eb_n0, ber, rtt_ms, capacity)."""
     c_n = BASE_C_N
     eb_n0 = BASE_EB_N0
     rtt = BASE_RTT_MS
+
+    # --- Stage-1 fault: storm rain fade (Ku absorption+scattering) ---
+    c_n -= RAIN_DB
+    eb_n0 -= RAIN_DB
+
+    # --- Stage-1 fault: wind drift, antenna misaligned, G/T degraded ---
+    if not s.get("antenna_ok", True):
+        c_n -= POINT_LOSS_DB
+        eb_n0 -= POINT_LOSS_DB
 
     # --- frequency trap: gaseous absorption peaks (Ch 1.2) ---
     if abs(s["freq_ghz"] - 22) < 1.0:
@@ -115,8 +133,8 @@ def current_physics(s):
         c_n -= 3.0
         eb_n0 -= 3.0
 
-    # --- HPA trap: overdrive -> saturation, distortion ---
-    if s["hpa_pct"] > 90:
+    # --- HPA: linear boost to fight rain, saturation if overdriven ---
+    if s["hpa_pct"] > 96:
         c_n -= 2.5
         eb_n0 -= 2.5
     elif s["hpa_pct"] < 30:
@@ -124,11 +142,11 @@ def current_physics(s):
         c_n -= drop
         eb_n0 -= drop
     else:
-        # small benefit for raising power within linear region
-        c_n += (s["hpa_pct"] - 68) * 0.02
-        eb_n0 += (s["hpa_pct"] - 68) * 0.02
+        # EIRP boost within linear region: +0.22 dB per point above 68
+        c_n += (s["hpa_pct"] - 68) * 0.22
+        eb_n0 += (s["hpa_pct"] - 68) * 0.22
 
-    # --- MODCOD: capacity up, but required Eb/N0 up ---
+    # --- MODCOD: capacity up, but required Eb/N0 up (Stage-2 gate) ---
     cap, req = MODCODS.get(s["modcod"], MODCODS["QPSK_3/4"])
     margin = eb_n0 - req
     if margin >= 0:
@@ -146,17 +164,39 @@ def current_physics(s):
 
     return round(c_n, 1), round(eb_n0, 1), ber, int(rtt), cap
 
+def rf_locked(c_n):
+    """Stage-1 gate: modem carrier lock."""
+    return c_n >= LOCK_CN_DB
+
+def frame_loss_pct(ber, c_n):
+    """Stage-2 gate: link-layer frame loss derived from BER + lock."""
+    if not rf_locked(c_n):
+        return 100.0
+    if ber >= 1e-2:
+        return 100.0
+    if ber >= 1e-3:
+        return 35.0
+    if ber >= 1e-4:
+        return 8.0
+    return 0.0
+
+def current_gt(s):
+    return BASE_GT if s.get("antenna_ok", True) else round(BASE_GT - 7.5, 1)
+
 def current_throughput(s):
     if time.time() < s["down_until"]:
         return 0.0
     c_n, eb_n0, ber, rtt_ms, cap = current_physics(s)
+    # Total outage while RF unlocked or PHY dead
+    if not rf_locked(c_n):
+        return 0.0
     rtt = rtt_ms / 1000.0
     win_bytes = s["tcp_win_kb"] * 1024.0
     FLOWS = 4
 
     # Dead PHY -> near zero regardless of TCP
     if ber >= 1e-2:
-        return round(min(cap * 0.02, 0.4), 2)
+        return 0.0
     if ber >= 1e-3:
         return round(min(cap * 0.12, 5.0), 2)
 
@@ -180,8 +220,32 @@ def current_throughput(s):
                 thr = min(raw, 14.0, cap * ber_penalty)
     return round(max(thr, 0.15), 2)
 
+def link_stage(s):
+    """Game progress: 1=RF outage, 2=frames bad, 3=transport capped, 4=solved."""
+    c_n, _, ber, _, _ = current_physics(s)
+    if not rf_locked(c_n) or ber >= 1e-2:
+        return 1
+    if frame_loss_pct(ber, c_n) > 0:
+        return 2
+    thr = current_throughput(s)
+    if thr >= 35.0:
+        return 4
+    return 3
+
 def link_state_label(thr):
     return "NOMINAL" if thr >= 35.0 else "DEGRADED"
+
+SUCCESS_MSG = (
+    "SUCCESS: Link restored — GW2<>GEO1<>VSAT7 NOMINAL (>=35 Mbps). "
+    "Well done, night shift — storm outage cleared, contract met!"
+)
+
+STAGE_HINTS = {
+    1: "STAGE 1/3 — RF OUTAGE: no carrier lock (thr 0). Check /tools/rf (C/N vs lock, G/T, Eb/N0) + /tools/ttc (orbit/payload). Suspects: antenna drift, rain fade, HPA.",
+    2: "STAGE 2/3 — RF LOCKED but frames dropping. Check /tools/rf (MODCOD vs Eb/N0, BER, frame loss). Suspects: bandwidth-limited MODCOD under rain — fall back to robust QPSK.",
+    3: "STAGE 3/3 — Frames clean but TCP stalled. Check /tools/tcp (RTT vs window = BDP, PEP/SACK). Suspects: GEO delay + small window + Reno backoff.",
+    4: SUCCESS_MSG,
+}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -217,24 +281,34 @@ class H(BaseHTTPRequestHandler):
             # Health check for Render / load balancers
             return self._send({"ok": True, "service": "sat-1-simulator"})
         if path == "/status":
-            # Symptom only: throughput + verdict. No diagnostic numbers here by design —
-            # use /tools/rf and /tools/tcp to earn the diagnosis in stages.
+            # Symptom + game stage gate. No diagnostic numbers here by design —
+            # use /tools/rf, /tools/tcp, /tools/ttc to earn the diagnosis in stages.
             sid, s = get_state(self._sid_from_get())
             thr = current_throughput(s)
-            return self._send({
+            result = link_state_label(thr)
+            stage = link_stage(s)
+            resp = {
                 "link": "GW2<>GEO1<>VSAT7",
                 "student": sid,
                 "thr_mbps": thr,
-                "result": link_state_label(thr),
+                "result": result,
+                "stage": stage,
+                "stage_hint": STAGE_HINTS[stage],
                 "controls_used": control_used(sid),
-                "tools": ["/tools/rf", "/tools/tcp"],
-            })
+                "tools": ["/tools/rf", "/tools/tcp", "/tools/ttc"],
+            }
+            if result == "NOMINAL":
+                resp["message"] = SUCCESS_MSG
+            return self._send(resp)
         if path == "/tools/rf":
             # Virtual spectrum analyzer + demod stats (RF / PHY domain).
             sid, s = get_state(self._sid_from_get())
             c_n, eb_n0, ber, rtt, cap = current_physics(s)
             thr = current_throughput(s)
-            bw_used = min(36.0, thr / MODCODS[s["modcod"]][0] * 36.0 * 0.95 + 1.2)
+            if thr <= 0:
+                bw_used = 0.0
+            else:
+                bw_used = min(36.0, thr / MODCODS[s["modcod"]][0] * 36.0 * 0.95 + 1.2)
             return self._send({
                 "tool": "rf",
                 "student": sid,
@@ -244,7 +318,10 @@ class H(BaseHTTPRequestHandler):
                 "c_n_db": c_n,
                 "eb_n0_db": eb_n0,
                 "ber": ber,
-                "g_t": BASE_GT,
+                "locked": rf_locked(c_n),
+                "lock_threshold_cn_db": LOCK_CN_DB,
+                "frame_loss_pct": frame_loss_pct(ber, c_n),
+                "g_t": current_gt(s),
                 "hpa_pct": s["hpa_pct"],
                 "modcod": s["modcod"],
                 "bw_alloc_mhz": 36,
@@ -263,7 +340,21 @@ class H(BaseHTTPRequestHandler):
                 "pep": s["pep"],
                 "link_arq": s["link_arq"],
             })
-        return self._send({"error": "unknown endpoint. use /status, /tools/rf, /tools/tcp or /control"}, 404)
+        if path == "/tools/ttc":
+            # TT&C telemetry (space + control segment): is the satellite itself healthy?
+            sid, s = get_state(self._sid_from_get())
+            return self._send({
+                "tool": "ttc",
+                "student": sid,
+                "satellite": "GEO1",
+                "orbit_km": s["orbit_km"],
+                "orbit_nominal_km": 35786,
+                "station_keeping": "NOMINAL" if s["orbit_km"] == 35786 else "DRIFT",
+                "payload": s["payload"],
+                "payload_health": "NOMINAL",
+                "note": "bent-pipe: no onboard demod/remod",
+            })
+        return self._send({"error": "unknown endpoint. use /status, /tools/rf, /tools/tcp, /tools/ttc or /control"}, 404)
 
     def do_POST(self):
         if urlparse(self.path).path != "/control":
@@ -290,7 +381,12 @@ class H(BaseHTTPRequestHandler):
         rationale = body.get("rationale", body.get("hypothesis", ""))
         if cmd == "reset":
             sid, s = reset_state(raw_sid)
-            return self._send({"ack": f"session {sid} reset to baseline", "thr_mbps": current_throughput(s), "result": link_state_label(current_throughput(s)), "student": sid})
+            thr = current_throughput(s)
+            result = link_state_label(thr)
+            resp = {"ack": f"session {sid} reset to baseline", "thr_mbps": thr, "result": result, "student": sid}
+            if result == "NOMINAL":
+                resp["message"] = SUCCESS_MSG
+            return self._send(resp)
         # Hypothesis-first: every mutating command must carry the student's reasoning.
         # This is graded (commands_log keeps it) and blocks blind copy-paste scripts.
         if not isinstance(rationale, str) or len(rationale.strip()) < MIN_RATIONALE:
@@ -342,7 +438,8 @@ class H(BaseHTTPRequestHandler):
             s["link_arq"] = 1 if val in (1, True, "1", "on", "enable") else 0
             msg = f"link ARQ {'on' if s['link_arq'] else 'off'}"
         elif cmd == "repoint":
-            msg = "antenna repoint complete. G/T nominal."
+            s["antenna_ok"] = True
+            msg = "antenna repoint complete. LNA inspected, G/T nominal."
         elif cmd == "reboot":
             s["down_until"] = time.time() + 8
             s["reboots"] += 1
@@ -358,7 +455,14 @@ class H(BaseHTTPRequestHandler):
             return self._send({"error": f"unknown cmd. options: {opts}"}, 400)
 
         thr = current_throughput(s)
-        self._send({"ack": msg, "thr_mbps": thr, "result": link_state_label(thr), "student": sid, "controls_used": control_used(sid)})
+        result = link_state_label(thr)
+        stage = link_stage(s)
+        resp = {"ack": msg, "thr_mbps": thr, "result": result,
+                "stage": stage, "stage_hint": STAGE_HINTS[stage],
+                "student": sid, "controls_used": control_used(sid)}
+        if result == "NOMINAL":
+            resp["message"] = SUCCESS_MSG
+        self._send(resp)
 
 if __name__ == "__main__":
     # Render injects $PORT (e.g. 10000). Use it by default, allow --port override.

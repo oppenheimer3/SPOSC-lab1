@@ -1,9 +1,9 @@
 # SPOSC Lab 1 — Project Context (Render-publishable)
 
 ## What this is
-GEO bent-pipe link simulator for a night-shift troubleshooting lab.
-Students get only `GET /status` + `POST /control`, must reach `NOMINAL (>=35 Mbps)`.
-Current hidden fault: healthy PHY, transport BDP starvation (see INSTRUCTOR_KEY.md, never public).
+GEO bent-pipe link simulator for a night-shift troubleshooting lab — STORM OUTAGE edition.
+Students get `GET /status` + `POST /control` + diagnostic tools, must climb 3 stages to `NOMINAL (>=35 Mbps)`.
+Starting fault: total outage 0 Mbps (rain fade 7 dB + antenna drift 7 dB + 256APSK fragility + BDP starvation; see INSTRUCTOR_KEY.md, never public).
 
 Live: https://sposc-lab1.onrender.com/
 GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
@@ -27,11 +27,11 @@ GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
 7. Free tier sleeps after idle (~50s cold start) — warn students to retry once
 
 ## Anti-AI-friction design (do not regress this)
-- `/status` = symptom only (`thr_mbps`, `result`, `controls_used`, tool list). NEVER add diagnostic fields back.
-- `/tools/rf` = PHY domain (payload, orbit, freq, C/N, Eb/N0, BER, G/T, HPA, MODCOD, bw). `/tools/tcp` = transport (RTT, window, SACK, PEP, ARQ).
+- `/status` = symptom + game stage (`thr_mbps`, `result`, `stage`, `stage_hint`, `controls_used`, tool list). NEVER add RF/TCP numbers here.
+- `/tools/rf` = PHY domain (payload, orbit, freq, C/N, lock + threshold, frame loss, Eb/N0, BER, G/T, HPA, MODCOD, bw). `/tools/tcp` = transport (RTT, window, SACK, PEP, ARQ). `/tools/ttc` = space segment (orbit health, payload — confirms satellite is fine).
 - `POST /control` requires `rationale`/`hypothesis` (min `MIN_RATIONALE=15` chars) on mutating cmds; logged in `commands_log`; `reset` exempt.
-- Budgets: `MAX_CONTROLS=30` mutating cmds per student via `CONTROL_USED` (survives `reset`); grading demands ≤8 for full marks.
-- Physics (`current_physics(s)` / `current_throughput(s)`) unchanged — same hidden fault, same solve path.
+- Budgets: `MAX_CONTROLS=30` mutating cmds per student via `CONTROL_USED` (survives `reset`); grading demands ≤8 for full marks (intended solve is 6).
+- Physics (`current_physics(s)` / `current_throughput(s)`) owns the 3-stage gates: rain + pointing → lock; MODCOD margin → frame loss; PEP+SACK+window → BDP fill.
 
 ## Session model (per-student isolation)
 - `SESSIONS: dict[sid -> state]` + `fresh_state()` factory; `get_state(sid)` / `reset_state(sid)` under `SESSIONS_LOCK`
@@ -42,26 +42,27 @@ GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
 - `/status` echoes `"student": sid` so students can verify they are on their own session
 
 ## Where the exercise logic lives (`sat_api.py`)
-- `fresh_state()` — defaults = baseline students see (orbit, freq, hpa, modcod, tcp_win, sack, pep, arq)
-- `MODCODS` — `(capacity_mbps, required_EbN0)`: raising capacity raises required Eb/N0 (cliff effect)
-- `current_physics(s)` — C/N, Eb/N0, BER, RTT, capacity; owns RF traps (freq absorption at ~22/60 GHz, HPA saturation >90%, ARQ +320ms)
-- `current_throughput(s)` — owns transport model (BDP cap 5.5 Mbps without PEP, 12–14 partial, full capacity only if pep+sack+window>=BDP)
-- `link_state_label()` — `NOMINAL if thr >= 35.0`
-- `H.do_GET / do_POST` — keep `/status` output minimal/terse (no hints); every `POST cmd` is logged to `commands_log` for grading
+- `fresh_state()` — outage baseline (256APSK, HPA 68, antenna misaligned, window 64, no PEP/SACK)
+- `MODCODS` — `(capacity_mbps, required_EbN0)`: QPSK_1/2 safe-but-capped (28), QPSK_3/4 sweet spot (42), higher orders die under rain (cliff effect)
+- `current_physics(s)` — rain + pointing penalties, HPA linear boost (saturates >96), freq traps, ARQ latency; owns Stage-1 lock gate (`LOCK_CN_DB=6.0`)
+- `current_throughput(s)` — 0 while unlocked/dead PHY; transport model (BDP cap 5.5 without PEP, 12–14 partial, full capacity only if pep+sack+window>=BDP); owns Stage-3 gate
+- `link_stage()` — 1=RF outage, 2=frames bad, 3=transport capped, 4=solved; `STAGE_HINTS` guides without revealing values
+- `link_state_label()` — `NOMINAL if thr >= 35.0` (+ `SUCCESS_MSG` on solve)
+- `H.do_GET / do_POST` — `/status` minimal + stage hint; `/tools/*` split telemetry; every `POST cmd` logged with rationale for grading
 
 ## How to alter the exercise safely
-- New fault: change `STATE` defaults + corresponding model branch (e.g. make PHY sick: lower `BASE_EB_N0`, raise `BASE_RTT_MS`, set `hpa_pct` low)
+- New fault: change `STATE` defaults + corresponding model branch (e.g. rain dB, pointing loss, lock threshold, MODCOD reqs)
 - Keep exactly one working combination; update `INSTRUCTOR_KEY.md` (local) with new numbers + why each decoy fails
-- Keep `/status` field names stable unless you also update `LAB.md` tasks/grading (BDP math depends on `rtt_ms` + `tcp_win_kb` fields existing)
-- Test matrix after any change: baseline `thr` DEGRADED → each decoy behaves as documented → intended fix reaches NOMINAL ≤8 cmds
-- Never reveal diagnosis in `ack`/`status`; keep `bw_used` derivation consistent with `MODCODS[modcod]`
+- Keep `/status` field names stable unless you also update `LAB.md` tasks/grading (BDP math depends on `rtt_ms` + `tcp_win_kb` fields existing; stage flow depends on `stage`/`stage_hint`)
+- Test matrix after any change: baseline `thr` 0.0 stage 1 → repoint alone still locked=false → repoint+HPA92 locked but frames 100% → QPSK_3/4 frames 0% thr ~3.9 → full transport 42 NOMINAL stage 4 in 6 cmds; QPSK_1/2 caps 28; HPA100 saturates; 22/60 GHz die
+- Never reveal diagnosis in `ack`/`status` beyond `stage_hint` domain pointers; keep `bw_used` derivation consistent with `MODCODS[modcod]`
 
 ## Local test before pushing (must pass)
 ```bash
 PORT=8766 python3 sat_api.py & pid=$!
 sleep 1
 curl -s localhost:8766/                    # {"ok": true, ...}
-curl -s localhost:8766/status | python3 -m json.tool   # baseline DEGRADED
+curl -s localhost:8766/status | python3 -m json.tool   # baseline 0.0 DEGRADED stage 1
 curl -s -X POST localhost:8766/control -H 'Content-Type: application/json' -d '{"cmd":"set_hpa","value":68}'
 kill $pid
 ```
