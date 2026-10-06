@@ -6,16 +6,16 @@ GEO bent-pipe, Ku-band. STORM OUTAGE scenario: 3-stage restore.
   Stage 2 (PHY/MODCOD): 256APSK bandwidth-limited -> BER collapse. Fix: fallback QPSK_3/4 (QPSK_1/2 safe but slow).
   Stage 3 (transport): BDP starvation, 64KB window vs ~500ms RTT. Fix: PEP + SACK + window>=2500.
 Run: python3 sat_api.py [--port 8765]
-  GET  /status?student=ID      -> symptom only (thr_mbps, result)
-  GET  /tools/rf?student=ID    -> RF/PHY diagnostics (demod + spectrum)
-  GET  /tools/tcp?student=ID   -> transport diagnostics (RTT, window, SACK/PEP/ARQ)
-  GET  /tools/ttc?student=ID   -> TT&C / space segment (orbit, payload health)
+  GET  /status?student=ID      -> full dump (thr, status up/down, stage, rf, tcp, ttc)
+  GET  /tools/rf?student=ID    -> RF/PHY filtered view (same numbers as /status rf block)
+  GET  /tools/tcp?student=ID   -> transport filtered view
+  GET  /tools/ttc?student=ID   -> TT&C filtered view
   POST /control                -> {"cmd": "...", "value": ..., "student": "ID", "rationale": "why (min 15 chars)"}
 Per-student isolation: each student ID gets its own simulator state on the
 same shared Render service, so one student solving does not solve it for others.
 Omit student -> shared fallback session ("shared").
 Control budget: 30 mutating commands per student (reset excluded, survives reset).
-No full-state dump exists: diagnosis must be earned tool by tool.
+Reach status "up" (thr >= 35 Mbps) to clear the outage.
 """
 import argparse
 import copy
@@ -233,19 +233,59 @@ def link_stage(s):
     return 3
 
 def link_state_label(thr):
-    return "NOMINAL" if thr >= 35.0 else "DEGRADED"
+    return "up" if thr >= 35.0 else "down"
 
-SUCCESS_MSG = (
-    "SUCCESS: Link restored — GW2<>GEO1<>VSAT7 NOMINAL (>=35 Mbps). "
-    "Well done, night shift — storm outage cleared, contract met!"
-)
+SUCCESS_MSG = "Link UP — GW2<>GEO1<>VSAT7 back at >=35 Mbps. Storm outage cleared!"
 
-STAGE_HINTS = {
-    1: "STAGE 1/3 — RF OUTAGE: no carrier lock (thr 0). Check /tools/rf (C/N vs lock, G/T, Eb/N0) + /tools/ttc (orbit/payload). Suspects: antenna drift, rain fade, HPA.",
-    2: "STAGE 2/3 — RF LOCKED but frames dropping. Check /tools/rf (MODCOD vs Eb/N0, BER, frame loss). Suspects: bandwidth-limited MODCOD under rain — fall back to robust QPSK.",
-    3: "STAGE 3/3 — Frames clean but TCP stalled. Check /tools/tcp (RTT vs window = BDP, PEP/SACK). Suspects: GEO delay + small window + Reno backoff.",
-    4: SUCCESS_MSG,
-}
+def full_status(sid, s):
+    """Everything at once: symptom + RF + transport + TT&C."""
+    c_n, eb_n0, ber, rtt, cap = current_physics(s)
+    _, req = MODCODS.get(s["modcod"], MODCODS["QPSK_3/4"])
+    thr = current_throughput(s)
+    bdp_kb = round(rtt / 1000.0 * 42.0 * 1e6 / 8.0 / 1024.0)
+    if thr <= 0:
+        bw_used = 0.0
+    else:
+        bw_used = min(36.0, thr / MODCODS[s["modcod"]][0] * 36.0 * 0.95 + 1.2)
+    return {
+        "link": "GW2<>GEO1<>VSAT7",
+        "student": sid,
+        "thr_mbps": thr,
+        "status": link_state_label(thr),
+        "stage": link_stage(s),
+        "rf": {
+            "c_n_db": c_n,
+            "lock_threshold_db": LOCK_CN_DB,
+            "locked": rf_locked(c_n),
+            "g_t": current_gt(s),
+            "g_t_nominal": BASE_GT,
+            "hpa_pct": s["hpa_pct"],
+            "freq_ghz": s["freq_ghz"],
+            "modcod": s["modcod"],
+            "eb_n0_db": eb_n0,
+            "eb_n0_required_db": req,
+            "ber": ber,
+            "frame_loss_pct": frame_loss_pct(ber, c_n),
+            "bw_used_mhz": round(bw_used, 1),
+            "bw_alloc_mhz": 36,
+        },
+        "tcp": {
+            "rtt_ms": rtt if time.time() >= s["down_until"] else 0,
+            "tcp_win_kb": s["tcp_win_kb"],
+            "bdp_kb": bdp_kb,
+            "sack": s["sack"],
+            "pep": s["pep"],
+            "link_arq": s["link_arq"],
+        },
+        "ttc": {
+            "orbit_km": s["orbit_km"],
+            "station_keeping": "NOMINAL" if s["orbit_km"] == 35786 else "DRIFT",
+            "payload": s["payload"],
+            "payload_health": "NOMINAL",
+        },
+        "controls_used": control_used(sid),
+        "tools": ["/tools/rf", "/tools/tcp", "/tools/ttc"],
+    }
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -281,23 +321,10 @@ class H(BaseHTTPRequestHandler):
             # Health check for Render / load balancers
             return self._send({"ok": True, "service": "sat-1-simulator"})
         if path == "/status":
-            # Symptom + game stage gate. No diagnostic numbers here by design —
-            # use /tools/rf, /tools/tcp, /tools/ttc to earn the diagnosis in stages.
+            # Full dump: symptom + RF + transport + TT&C in one call.
             sid, s = get_state(self._sid_from_get())
-            thr = current_throughput(s)
-            result = link_state_label(thr)
-            stage = link_stage(s)
-            resp = {
-                "link": "GW2<>GEO1<>VSAT7",
-                "student": sid,
-                "thr_mbps": thr,
-                "result": result,
-                "stage": stage,
-                "stage_hint": STAGE_HINTS[stage],
-                "controls_used": control_used(sid),
-                "tools": ["/tools/rf", "/tools/tcp", "/tools/ttc"],
-            }
-            if result == "NOMINAL":
+            resp = full_status(sid, s)
+            if resp["status"] == "up":
                 resp["message"] = SUCCESS_MSG
             return self._send(resp)
         if path == "/tools/rf":
@@ -382,9 +409,9 @@ class H(BaseHTTPRequestHandler):
         if cmd == "reset":
             sid, s = reset_state(raw_sid)
             thr = current_throughput(s)
-            result = link_state_label(thr)
-            resp = {"ack": f"session {sid} reset to baseline", "thr_mbps": thr, "result": result, "student": sid}
-            if result == "NOMINAL":
+            resp = {"ack": f"session {sid} reset to baseline", "thr_mbps": thr,
+                    "status": link_state_label(thr), "stage": link_stage(s), "student": sid}
+            if resp["status"] == "up":
                 resp["message"] = SUCCESS_MSG
             return self._send(resp)
         # Hypothesis-first: every mutating command must carry the student's reasoning.
@@ -455,12 +482,9 @@ class H(BaseHTTPRequestHandler):
             return self._send({"error": f"unknown cmd. options: {opts}"}, 400)
 
         thr = current_throughput(s)
-        result = link_state_label(thr)
-        stage = link_stage(s)
-        resp = {"ack": msg, "thr_mbps": thr, "result": result,
-                "stage": stage, "stage_hint": STAGE_HINTS[stage],
-                "student": sid, "controls_used": control_used(sid)}
-        if result == "NOMINAL":
+        resp = {"ack": msg, "thr_mbps": thr, "status": link_state_label(thr),
+                "stage": link_stage(s), "student": sid, "controls_used": control_used(sid)}
+        if resp["status"] == "up":
             resp["message"] = SUCCESS_MSG
         self._send(resp)
 

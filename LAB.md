@@ -18,28 +18,28 @@ Base URL: `https://sposc-lab1.onrender.com`
 Each student gets an isolated simulator: always use your own ID (e.g. Neptun code, lowercase).
 Use it on every call, otherwise you share the `shared` session with anyone who forgot their ID.
 
-There is NO single dump of all telemetry. Like a real SCC, you pick a diagnostic tool,
-form a hypothesis first, then query. Pasting one JSON blob into a chatbot will not solve this.
-
-Step 1 — symptom (free, repeat any time):
+One call shows you everything. Form a hypothesis, then query:
 
 ```bash
 curl -s "https://sposc-lab1.onrender.com/status?student=YOUR_ID" | python3 -m json.tool
 ```
-Returns `thr_mbps` + `result` + your game `stage` (1–4) and a `stage_hint` telling you which domain to look at next. No RF or TCP numbers.
+Returns `thr_mbps` + `status` (`down`/`up`) + your game `stage` (1–4), plus full blocks:
+`rf` (C/N vs lock threshold, G/T, HPA, MODCOD, Eb/N0 vs required, BER, frame loss, bandwidth),
+`tcp` (RTT, window vs ready-computed BDP, SACK, PEP, ARQ),
+`ttc` (orbit, station-keeping, payload health).
 
-Step 2 — pick a diagnostic tool based on your hypothesis:
+Filtered views of the same numbers (optional):
 
 ```bash
 curl -s "https://sposc-lab1.onrender.com/tools/rf?student=YOUR_ID" | python3 -m json.tool
 curl -s "https://sposc-lab1.onrender.com/tools/tcp?student=YOUR_ID" | python3 -m json.tool
 curl -s "https://sposc-lab1.onrender.com/tools/ttc?student=YOUR_ID" | python3 -m json.tool
 ```
-- `/tools/rf` = spectrum analyzer + demod stats (frequency, power, MODCOD, C/N, Eb/N0, BER, lock, frame loss, G/T, bandwidth).
-- `/tools/tcp` = TCP trace (RTT, window, SACK, PEP, link ARQ).
-- `/tools/ttc` = TT&C telemetry (orbit, station-keeping, payload health — is the satellite itself the problem?).
 
-Step 3 — intervene. Every command MUST carry your hypothesis in `rationale`
+Tip: the helper scripts do this for you — `python scripts/status.py` polls the full
+status live, `python scripts/command.py --cmd ...` sends commands.
+
+Step 2 — intervene. Every command MUST carry your hypothesis in `rationale`
 (min 15 characters), or it is rejected. It is logged and graded.
 
 ```bash
@@ -75,9 +75,9 @@ Allowed `cmd` values:
 | `set_payload_mode` | `BENT` / `REGEN` | payload processing mode |
 | `reset` | — | reset YOUR session to baseline |
 
-The API replies `{"ack": ..., "thr_mbps": ..., "result": "DEGRADED"|"NOMINAL", "stage": 1-4, "stage_hint": ...}`.
-On success (`NOMINAL`) it also sends a `message` field confirming the restore.
-`NOMINAL` (≥ 35 Mbps) means you fixed it.
+The API replies `{"ack": ..., "thr_mbps": ..., "status": "down"|"up", "stage": 1-4}`.
+On success it also sends a short `message` confirming the restore.
+`up` (≥ 35 Mbps) means you fixed it.
 Always check the `student` field in replies — if it is not your ID, you forgot to send it.
 
 ## 3. The three stages (your mission)
@@ -98,7 +98,7 @@ Carrier is locked but frames drop: the link is stuck in bandwidth-limited `256AP
 Frames are clean but TCP stalls: GEO RTT ~542 ms × rate = BDP ≈ 2.8 MB, while the default 64 KB window exhausts long before ACKs return; residual errors halve cwnd (Reno).
 - Activate `PEP` (spoofing + split-TCP), enable `SACK` (isolate wireless loss from congestion), scale the window ≥ 2500 KB (4096 recommended).
 - Window alone caps ~5.5 Mbps; PEP without SACK caps ~12–14 Mbps. All three together fill the pipe.
-- Gate: throughput ramps smoothly to ≥ 35 Mbps. API returns `NOMINAL` + success `message`. You are done.
+- Gate: throughput ramps smoothly to ≥ 35 Mbps. API returns `status: up` + success `message`. You are done.
 
 ## 4. What the shift log says (unverified rumors — trust numbers, not stories)
 
@@ -118,12 +118,12 @@ Frames are clean but TCP stalls: GEO RTT ~542 ms × rate = BDP ≈ 2.8 MB, while
    - Link-budget check (needs `/tools/rf`): is `C/N` vs lock threshold, `Eb/N0` vs MODCOD requirement, `BER`, `frame_loss_pct`, `G/T`, `hpa_pct` healthy or not? Which stage does each number implicate?
    - Classify per stage: Stage 1 power-limited (C/N)? Stage 2 bandwidth- vs power-limited (MODCOD)? Stage 3 transport-limited (BDP)?
 2. **Map to layers (15 min).** For each candidate fix in the table above, state which segment (space / ground / control) and which OSI layer (PHY / link / network / transport) it acts on. Which layer do your numbers actually implicate at each stage?
-3. **Intervene (45 min).** You have 30 commands and every one needs a `rationale` — it is logged and graded. Follow the stages: (1) repoint + HPA → RF lock; (2) MODCOD fallback → 0% frame loss; (3) PEP + SACK + window → NOMINAL. Propose a hypothesis, send ONE command, re-measure with the right tool, record. Repeat. Reach `NOMINAL`.
+3. **Intervene (45 min).** You have 30 commands and every one needs a `rationale` — it is logged and graded. Follow the stages: (1) repoint + HPA → RF lock; (2) MODCOD fallback → 0% frame loss; (3) PEP + SACK + window → link up. Propose a hypothesis, send ONE command, re-check status, record. Repeat. Reach `up`.
    - Only **one combination** restores the contract. The rest do nothing or make it worse (saturation, absorption peaks, ARQ latency, outage, slow-but-capped QPSK_1/2). Brute-forcing without a hypothesis is rejected by the API and penalized in grading.
 4. **Report (15 min, 1 page max).** Submit:
    - Initial status dump + your three calculations from (1).
    - Command log with hypothesis → result for each attempt, labeled by stage.
-   - Final status dump showing `NOMINAL` + success message.
+   - Final status dump showing `up` + success message.
    - Explanation: why did each stage's fix work, and why did at least three alternatives fail — using Ch.1 terms: bent-pipe vs regenerative, GEO delay, FSPL, rain fade, gaseous absorption, `Eb/N0` vs BER, power- vs bandwidth-limited, BDP / slow-start / Reno / PEP / SACK.
 
 ## 6. Rules
@@ -131,14 +131,14 @@ Frames are clean but TCP stalls: GEO RTT ~542 ms × rate = BDP ≈ 2.8 MB, while
 - Do not read `sat_api.py`. Treating it as the answer key is a fail.
 - Do not assume the fault is where the rumors say it is — except the storm, which is real.
 - A healthy TT&C with a dead throughput is data, not a contradiction. Think layers and stages.
-- AI tools are permitted, but a single paste cannot solve this: telemetry is split across
-  tools and every command needs your own stated hypothesis. An AI that tells you *what
-  to measure next* is being used well; one you ask for the final answer will guess.
+- AI tools are permitted, but every command needs your own stated hypothesis — it is
+  logged and graded. An AI that tells you *what to try next* is being used well;
+  one you ask for the final answer will guess decoys (max HPA, 256APSK, 22 GHz).
 - Use only YOUR student ID; solving in another session does not count.
 
 ## Grading (10 pts)
 
 - Correct BDP + link-budget verdict per stage (3)
 - Correct layer/segment mapping (2)
-- Reaching NOMINAL with ≤ 8 commands and a logged hypothesis per command (3)
+- Reaching `up` with ≤ 8 commands and a logged hypothesis per command (3)
 - Correct Ch.1 explanation of each stage fix + 3 failed alternatives (2)
