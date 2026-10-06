@@ -6,16 +6,19 @@ GEO bent-pipe, Ku-band. STORM OUTAGE scenario: 3-stage restore.
   Stage 2 (PHY/MODCOD): 256APSK bandwidth-limited -> BER collapse. Fix: fallback QPSK_3/4 (QPSK_1/2 safe but slow).
   Stage 3 (transport): BDP starvation, 64KB window vs ~500ms RTT. Fix: PEP + SACK + window>=2500.
 Run: python3 sat_api.py [--port 8765]
-  GET  /status?student=ID      -> full dump (thr, status up/down, stage, rf, tcp, ttc)
+  GET  /status?student=ID      -> full dump (thr, status up/down, stage, hint, rf, tcp, ttc)
   GET  /tools/rf?student=ID    -> RF/PHY filtered view (same numbers as /status rf block)
   GET  /tools/tcp?student=ID   -> transport filtered view
   GET  /tools/ttc?student=ID   -> TT&C filtered view
-  POST /control                -> {"cmd": "...", "value": ..., "student": "ID", "rationale": "why (min 15 chars)"}
+  POST /control                -> {"cmd": "...", "value": ..., "student": "ID"}
 Per-student isolation: each student ID gets its own simulator state on the
 same shared Render service, so one student solving does not solve it for others.
 Omit student -> shared fallback session ("shared").
 Control budget: 30 mutating commands per student (reset excluded, survives reset).
 Reach status "up" (thr >= 35 Mbps) to clear the outage.
+Game guidance lives in the API, not the handout: /status always returns a
+'hint' for the current stage, and /control returns a 'message' exactly when
+a stage is cleared (final clear = success message).
 """
 import argparse
 import copy
@@ -77,8 +80,7 @@ def reset_state(sid):
 # Anti-brute-force budgets (per student, survives session reset).
 CONTROL_USED = {}
 CONTROL_LOCK = threading.Lock()
-MAX_CONTROLS = 30     # hard cap on mutating commands per student (grading needs <=8 for full marks)
-MIN_RATIONALE = 15    # min chars of hypothesis required on every mutating command
+MAX_CONTROLS = 15     # hard cap on mutating commands per student (reset excluded, survives reset)
 
 def control_used(sid):
     with CONTROL_LOCK:
@@ -223,7 +225,7 @@ def current_throughput(s):
 def link_stage(s):
     """Game progress: 1=RF outage, 2=frames bad, 3=transport capped, 4=solved."""
     c_n, _, ber, _, _ = current_physics(s)
-    if not rf_locked(c_n) or ber >= 1e-2:
+    if not rf_locked(c_n):
         return 1
     if frame_loss_pct(ber, c_n) > 0:
         return 2
@@ -235,7 +237,31 @@ def link_stage(s):
 def link_state_label(thr):
     return "up" if thr >= 35.0 else "down"
 
-SUCCESS_MSG = "Link UP — GW2<>GEO1<>VSAT7 back at >=35 Mbps. Storm outage cleared!"
+SUCCESS_MSG = "Success, you restored the link, well done engineer! GW2<>GEO1<>VSAT7 is back at >=35 Mbps."
+
+# In-game guidance only (kept OUT of the PDF handout on purpose).
+# /status always carries the hint for the player's current stage.
+STAGE_HINTS = {
+    1: ("Stage 1 — signal is not locked (C/N below threshold). "
+        "Check 'rf' (C/N vs lock, G/T, HPA) and 'ttc' (is the satellite itself OK?). "
+        "Fix the physical channel first: antenna + power."),
+    2: ("Stage 1 cleared — carrier is locked! Now frames are still dropping "
+        "(BER / frame_loss_pct bad). The MODCOD is too fragile for this rain. "
+        "Check 'rf' (Eb/N0 vs required) and fall back to something more robust."),
+    3: ("Stage 2 cleared — frames are clean! Now throughput is still capped. "
+        "This is transport, not RF: check 'tcp' (RTT, window vs BDP, PEP, SACK). "
+        "Scale the pipe to fill the long GEO delay."),
+    4: SUCCESS_MSG,
+}
+
+# Short acknowledgment sent back by POST /control exactly when a stage is cleared.
+STAGE_CLEAR_MSGS = {
+    1: ("Stage 1 cleared — RF locked! Well done. "
+        "Next: fix the falling frames (check Eb/N0 vs MODCOD requirement)."),
+    2: ("Stage 2 cleared — frames are clean (0% loss)! Well done. "
+        "Next: fix the capped throughput (check window vs BDP, PEP, SACK)."),
+    3: SUCCESS_MSG,
+}
 
 def full_status(sid, s):
     """Everything at once: symptom + RF + transport + TT&C."""
@@ -247,12 +273,14 @@ def full_status(sid, s):
         bw_used = 0.0
     else:
         bw_used = min(36.0, thr / MODCODS[s["modcod"]][0] * 36.0 * 0.95 + 1.2)
-    return {
+    stage = link_stage(s)
+    resp = {
         "link": "GW2<>GEO1<>VSAT7",
         "student": sid,
         "thr_mbps": thr,
         "status": link_state_label(thr),
-        "stage": link_stage(s),
+        "stage": stage,
+        "hint": STAGE_HINTS[stage],
         "rf": {
             "c_n_db": c_n,
             "lock_threshold_db": LOCK_CN_DB,
@@ -286,6 +314,9 @@ def full_status(sid, s):
         "controls_used": control_used(sid),
         "tools": ["/tools/rf", "/tools/tcp", "/tools/ttc"],
     }
+    if resp["status"] == "up":
+        resp["message"] = SUCCESS_MSG
+    return resp
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -405,25 +436,22 @@ class H(BaseHTTPRequestHandler):
             raw_sid = self.headers.get("X-Student-ID", "shared")
         cmd = str(body.get("cmd", "")).strip().lower()
         val = body.get("value", None)
-        rationale = body.get("rationale", body.get("hypothesis", ""))
         if cmd == "reset":
             sid, s = reset_state(raw_sid)
             thr = current_throughput(s)
+            stage = link_stage(s)
             resp = {"ack": f"session {sid} reset to baseline", "thr_mbps": thr,
-                    "status": link_state_label(thr), "stage": link_stage(s), "student": sid}
+                    "status": link_state_label(thr), "stage": stage, "student": sid,
+                    "hint": STAGE_HINTS[stage]}
             if resp["status"] == "up":
                 resp["message"] = SUCCESS_MSG
             return self._send(resp)
-        # Hypothesis-first: every mutating command must carry the student's reasoning.
-        # This is graded (commands_log keeps it) and blocks blind copy-paste scripts.
-        if not isinstance(rationale, str) or len(rationale.strip()) < MIN_RATIONALE:
-            sid = normalize_sid(raw_sid)
-            return self._send({"error": f"rationale required: include 'rationale' with your hypothesis (min {MIN_RATIONALE} chars) explaining why this command helps", "student": sid}, 400)
         sid, s = get_state(raw_sid)
+        stage_before = link_stage(s)
         used = bump_controls(sid)
         if used > MAX_CONTROLS:
-            return self._send({"error": f"control budget exhausted ({MAX_CONTROLS} commands per student). Reset does not refill it — review your hypothesis log.", "student": sid}, 429)
-        s["commands_log"].append({"cmd": cmd, "value": val, "rationale": rationale.strip(), "t": time.time()})
+            return self._send({"error": f"control budget exhausted ({MAX_CONTROLS} commands per student). Reset does not refill it.", "student": sid}, 429)
+        s["commands_log"].append({"cmd": cmd, "value": val, "t": time.time()})
         msg = ""
 
         if cmd == "set_hpa":
@@ -482,8 +510,17 @@ class H(BaseHTTPRequestHandler):
             return self._send({"error": f"unknown cmd. options: {opts}"}, 400)
 
         thr = current_throughput(s)
+        stage_after = link_stage(s)
         resp = {"ack": msg, "thr_mbps": thr, "status": link_state_label(thr),
-                "stage": link_stage(s), "student": sid, "controls_used": control_used(sid)}
+                "stage": stage_after, "student": sid, "controls_used": control_used(sid),
+                "hint": STAGE_HINTS[stage_after]}
+        if stage_after > stage_before:
+            # Acknowledge exactly what was cleared + what to do next.
+            # A single command can clear two stages at once (e.g. MODCOD
+            # fallback both locks RF and cleans frames) — acknowledge both.
+            parts = [STAGE_CLEAR_MSGS[i] for i in range(stage_before, stage_after) if i in STAGE_CLEAR_MSGS]
+            if parts:
+                resp["message"] = " ".join(parts)
         if resp["status"] == "up":
             resp["message"] = SUCCESS_MSG
         self._send(resp)

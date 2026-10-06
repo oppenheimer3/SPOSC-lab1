@@ -4,7 +4,7 @@
 Usage:
     python status.py
     python status.py --interval 5 --once
-    STUDENT_ID=abc123 python status.py   (skips the prompt)
+    NAME=alice python status.py   (skips the prompt)
 
 Stdlib only. Ctrl+C to stop.
 """
@@ -25,18 +25,18 @@ def fetch_status(base_url, student):
 
 
 def ask_student_id():
-    preset = os.environ.get("STUDENT_ID", "").strip()
+    preset = os.environ.get("NAME", os.environ.get("STUDENT_ID", "")).strip()
     try:
         if preset:
-            ans = input(f"Student ID [{preset}]: ").strip()
+            ans = input(f"Your name [{preset}]: ").strip()
             return ans or preset
-        ans = input("Student ID: ").strip()
+        ans = input("Your name: ").strip()
     except EOFError:
         if preset:
             return preset
         ans = ""
     if not ans:
-        print("No student ID given, using the 'shared' session.", file=sys.stderr, flush=True)
+        print("No name given, using the 'shared' session.", file=sys.stderr, flush=True)
         return "shared"
     return ans
 
@@ -53,7 +53,7 @@ def main():
     a.student = ask_student_id()
 
     if a.student == "shared":
-        print("WARNING: using the 'shared' session. Type your own ID for your own simulator.",
+        print("WARNING: using the 'shared' session. Type your name for your own simulator.",
               file=sys.stderr, flush=True)
 
     while True:
@@ -71,6 +71,8 @@ def main():
             tcp = st.get("tcp", {})
             print(f"  tcp: RTT {tcp.get('rtt_ms')} ms win {tcp.get('tcp_win_kb')} KB (BDP {tcp.get('bdp_kb')} KB) "
                   f"PEP {tcp.get('pep')} SACK {tcp.get('sack')} ARQ {tcp.get('link_arq')}", flush=True)
+            if st.get("hint"):
+                print(f"  hint: {st['hint']}", flush=True)
             if st.get("message"):
                 print(f"  *** {st['message']} ***", flush=True)
         except Exception as e:  # noqa: BLE001 - keep polling through blips (cold starts, network)

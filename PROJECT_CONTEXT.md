@@ -10,7 +10,7 @@ GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
 
 ## Repo layout
 - `sat_api.py` — whole simulator, stdlib only (`http.server`, `argparse`, `os`, `json`, `math`, `time`)
-- `LAB.md` — student handout (source of truth, PDF built from it)
+- `scripts/lab.md` — student handout (source of truth, PDF built from it; distributed inside `scripts/` so the commands run as written)
 - `Lab1_Night_Shift.pdf` — generated handout
 - `requirements.txt` — intentionally dependency-free, keeps Render Python detection working
 - `render.yaml` — Blueprint: `pip install -r requirements.txt` / `python sat_api.py`, health check `/status`
@@ -29,8 +29,8 @@ GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
 ## Anti-AI-friction design (do not regress this)
 - `/status` = full dump in one call (`thr_mbps`, `status` down/up, `stage`, `rf` + `tcp` + `ttc` blocks, `controls_used`, tool list). `/tools/rf|tcp|ttc` = filtered views of the same numbers.
 - `/tools/rf` = PHY domain (payload, orbit, freq, C/N, lock + threshold, frame loss, Eb/N0, BER, G/T, HPA, MODCOD, bw). `/tools/tcp` = transport (RTT, window, SACK, PEP, ARQ). `/tools/ttc` = space segment (orbit health, payload — confirms satellite is fine).
-- `POST /control` requires `rationale`/`hypothesis` (min `MIN_RATIONALE=15` chars) on mutating cmds; logged in `commands_log`; `reset` exempt.
-- Budgets: `MAX_CONTROLS=30` mutating cmds per student via `CONTROL_USED` (survives `reset`); grading demands ≤8 for full marks (intended solve is 6).
+- `POST /control` takes `cmd` + `value` (+ student ID); no note/hypothesis required; every cmd logged in `commands_log`; `reset` exempt.
+- Budgets: `MAX_CONTROLS=15` mutating cmds per student via `CONTROL_USED` (survives `reset`); intended solve is 6.
 - Physics (`current_physics(s)` / `current_throughput(s)`) owns the 3-stage gates: rain + pointing → lock; MODCOD margin → frame loss; PEP+SACK+window → BDP fill.
 
 ## Session model (per-student isolation)
@@ -38,7 +38,7 @@ GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
 - SID sources (priority): POST JSON `student`/`id`/`sid` → query `?student=` → `X-Student-ID` header → `"shared"` fallback
 - SIDs normalized: lowercase, alnum/`-`/`_` only, max 64 chars; cap `MAX_SESSIONS=500` with oldest-eviction via `SESSIONS_LAST`
 - `ThreadingHTTPServer` (not `HTTPServer`) so concurrent students don't block each other
-- `POST {"cmd":"reset"}` resets only the caller's session; grading uses per-session `commands_log`
+- `POST {"cmd":"reset"}` resets only the caller's session; per-session `commands_log` keeps the audit trail
 - `/status` echoes `"student": sid` so students can verify they are on their own session
 
 ## Where the exercise logic lives (`sat_api.py`)
@@ -48,14 +48,14 @@ GitHub: https://github.com/oppenheimer3/SPOSC-lab1 (public, answer key excluded)
 - `current_throughput(s)` — 0 while unlocked/dead PHY; transport model (BDP cap 5.5 without PEP, 12–14 partial, full capacity only if pep+sack+window>=BDP); owns Stage-3 gate
 - `link_stage()` — 1=RF outage, 2=frames bad, 3=transport capped, 4=solved; `STAGE_HINTS` guides without revealing values
 - `link_state_label()` — `up if thr >= 35.0 else down` (+ short `SUCCESS_MSG` on solve)
-- `H.do_GET / do_POST` — `/status` minimal + stage hint; `/tools/*` split telemetry; every `POST cmd` logged with rationale for grading
+- `H.do_GET / do_POST` — `/status` full dump + stage `hint` (in-game guidance, kept out of `lab.md`); `/tools/*` split telemetry; every `POST cmd` logged in `commands_log`; `POST` returns `hint` always + `message` exactly on stage clear (`STAGE_CLEAR_MSGS`, final = `SUCCESS_MSG`)
 
 ## How to alter the exercise safely
 - New fault: change `STATE` defaults + corresponding model branch (e.g. rain dB, pointing loss, lock threshold, MODCOD reqs)
 - Keep exactly one working combination; update `INSTRUCTOR_KEY.md` (local) with new numbers + why each decoy fails
-- Keep `/status` field names stable unless you also update `LAB.md` tasks/grading (BDP math depends on `tcp.rtt_ms` + `tcp.tcp_win_kb` fields existing; stage flow depends on `stage`)
-- Test matrix after any change: baseline `thr` 0.0 stage 1 → repoint alone still locked=false → repoint+HPA92 locked but frames 100% → QPSK_3/4 frames 0% thr ~3.9 → full transport 42 up stage 4 in 6 cmds; QPSK_1/2 caps 28; HPA100 saturates; 22/60 GHz die
-- Keep replies short: `ack` + `thr_mbps` + `status` + `stage`; success `message` only when up; keep `bw_used` derivation consistent with `MODCODS[modcod]`
+- Keep `/status` field names stable (stage flow depends on `stage`; Ch.1 coursework uses `tcp.rtt_ms` + `tcp.tcp_win_kb` + `/tools/rf` fields)
+- Test matrix after any change: baseline `thr` 0.0 stage 1 → repoint alone still locked=false stage 1 → repoint+HPA92 locked but frames 100% stage 2 → QPSK_3/4 frames 0% thr ~3.9 stage 3 → full transport 42 up stage 4 in 6 cmds (one stage per step); QPSK_1/2 caps 28; HPA100 saturates; 22/60 GHz die
+- Keep replies short: `ack` + `thr_mbps` + `status` + `stage` + `hint`; `message` only on stage clear (final clear = success); keep `bw_used` derivation consistent with `MODCODS[modcod]`
 
 ## Local test before pushing (must pass)
 ```bash
@@ -69,7 +69,7 @@ kill $pid
 
 ## Publish flow
 ```bash
-git add sat_api.py LAB.md Lab1_Night_Shift.pdf requirements.txt render.yaml .gitignore PROJECT_CONTEXT.md
+git add sat_api.py scripts/lab.md Lab1_Night_Shift.pdf requirements.txt render.yaml .gitignore PROJECT_CONTEXT.md
 git commit -m "..."; git push origin main   # Render autoDeploys (or Manual Deploy in dashboard)
 # Verify: curl -s https://sposc-lab1.onrender.com/status
 # Reset between groups: Render dashboard → Restart / Redeploy
